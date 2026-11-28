@@ -33,3 +33,21 @@ def add_price_per_pack(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["price_per_pack"] = out["TOT_SALES"] / out["PROD_QTY"]
     return out
+
+
+def card_level_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per loyalty card: total sales, total packs, and price per pack.
+
+    Price per pack is total sales divided by total packs, so a card with many
+    purchases counts once, not once per purchase.
+    """
+    required = ["LYLTY_CARD_NBR", "LIFESTAGE", "PREMIUM_CUSTOMER", "TOT_SALES", "PROD_QTY"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    cards = (
+        df.groupby(["LYLTY_CARD_NBR", "LIFESTAGE", "PREMIUM_CUSTOMER"], as_index=False)
+        .agg(total_sales=("TOT_SALES", "sum"), packs=("PROD_QTY", "sum"))
+    )
+    cards["price_per_pack"] = cards["total_sales"] / cards["packs"]
+    return cards
