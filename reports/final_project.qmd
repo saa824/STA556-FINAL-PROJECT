@@ -10,4 +10,245 @@ execute:
 jupyter: python3
 ---
 
+```{python}
+#| label: setup
+#| include: false
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from src.features import card_level_summary
+from src.stats import (
+    difference_in_means,
+    permutation_test,
+    bootstrap_two_sample,
+    percentile_interval,
+    segment_mean_intervals,
+)
+
+SEED = 556
+N_PERM = 10_000
+N_BOOT = 10_000
+
+df_cust = pd.read_csv("data/processed/processed_data.csv", parse_dates=["DATE"])
+
+# Validation checks: stop with an error if the processed data change unexpectedly
+assert len(df_cust) == 246739
+assert df_cust["price_per_pack"].notna().all()
+assert df_cust["LIFESTAGE"].notna().all()
+
+
+# Counts from the raw transactions, used to explain what cleaning removed
+raw_trans = pd.read_csv(
+    "data/raw/Q_Transaction_Data.csv", usecols=["LYLTY_CARD_NBR", "STORE_NBR"]
+)
+n_cards_raw = raw_trans["LYLTY_CARD_NBR"].nunique()
+n_stores_raw = raw_trans["STORE_NBR"].nunique()
+n_cards = df_cust["LYLTY_CARD_NBR"].nunique()
+n_stores = df_cust["STORE_NBR"].nunique()
+```
+
+
 # Introduction
+
+## Background
+
+A grocery retail chain sells chips across its stores and records every purchase
+made with a loyalty card. Each card is linked to two labels: a life stage
+(from young singles and couples through families to retirees) and a customer
+tier (Budget, Mainstream or Premium) that reflects purchasing power. Together,
+the labels show who is buying what.
+
+Between July 2018 and June 2019, the cleaned data record
+`{python} f"{len(df_cust):,}"` chip transactions made by
+`{python} f"{df_cust['LYLTY_CARD_NBR'].nunique():,}"` loyalty cards across
+`{python} df_cust['STORE_NBR'].nunique()` stores, with total sales of
+`{python} f"${df_cust['TOT_SALES'].sum():,.0f}"`.
+
+## The Business Question
+
+Decisions about promotions, pricing and shelf space are easier when it is clear
+which customer groups matter and how they behave. A customer group that pays
+more per pack may be more willing to buy higher-priced products, and it could
+be treated differently from a group that mainly buys at low prices.
+
+This report examines one segment in detail: **Mainstream Young
+Singles/Couples**. The question is whether customers in this segment pay a
+higher average price per pack than all other customers, and whether the
+difference is larger than chance.
+
+## Approach
+
+The data are cleaned and joined, then summarized by customer segment. The
+segment's average price per pack is compared with that of all other customers
+using a permutation test, which asks whether a gap this large could arise by
+chance, and a bootstrap confidence interval, which shows how precisely the gap
+is estimated. Each loyalty card contributes one price, so that customers with
+many purchases do not dominate the result.
+
+
+# Data
+
+## Source
+
+The data come from the Quantium retail analytics simulation and consist of two
+files: a transaction file, where each row is one product bought in one
+transaction between July 2018 and June 2019, and a customer file giving each
+loyalty card a life stage and a customer tier. The two files are joined on the
+loyalty card number.
+
+The raw transaction file contains `{python} f"{n_cards_raw:,}"` loyalty cards
+and `{python} n_stores_raw` stores. Cleaning removes
+`{python} f"{n_cards_raw - n_cards:,}"` cards, which bought only salsa or the
+removed bulk purchases and therefore have no chip records, and
+`{python} n_stores_raw - n_stores` store whose records were all removed.
+
+## Unit of Observation
+
+In the cleaned data, each row is one product bought in one transaction. For the
+statistical comparison, the unit is one loyalty card, using the card's total
+sales divided by its total packs. This ensures that a customer with many
+purchases is not counted many times.
+
+## Variables
+
+| Variable | Meaning |
+|---|---|
+| `LYLTY_CARD_NBR` | Loyalty card number, used to join the two files |
+| `LIFESTAGE` | Life stage of the customer (7 groups), as labeled by the retailer |
+| `PREMIUM_CUSTOMER` | Customer tier: Budget, Mainstream or Premium |
+| `PROD_QTY`, `TOT_SALES` | Packs bought and dollars spent on a transaction record |
+| `price_per_pack` | `TOT_SALES / PROD_QTY`, derived |
+
+
+## Cleaning
+
+Three problems were found in the raw transaction file and removed
+(@tbl-cleaning): one exact duplicate record; salsa products, which are not
+chips and so fall outside the question; and two bulk purchases of 200 packs
+each, both from a single loyalty card with no other purchases. These are almost
+certainly commercial purchases and would distort the averages. The threshold of
+more than 10 packs in one record is a judgement call.
+
+```{python}
+#| label: tbl-cleaning
+#| tbl-cap: "Records removed at each cleaning step."
+labels = {
+    "raw rows": "Raw transaction records",
+    "exact duplicates removed": "Exact duplicates removed",
+    "salsa lines removed": "Salsa records removed (not chips)",
+    "bulk-purchase lines removed": "Bulk purchases removed (more than 10 packs)",
+    "rows kept": "Records kept for analysis",
+}
+cleaning_log = pd.read_csv("data/processed/cleaning_log.csv", index_col=0).rename(index=labels)
+cleaning_log["count"] = cleaning_log["count"].map("{:,}".format)
+cleaning_log.rename(columns={"count": "Records"}).rename_axis("Step")
+```
+
+## Missing Data
+
+```{python}
+#| label: missing-check
+#| include: false
+n_missing_values = int(df_cust.isna().sum().sum())
+all_days = pd.date_range(df_cust["DATE"].min(), df_cust["DATE"].max())
+missing_days = all_days.difference(pd.DatetimeIndex(df_cust["DATE"].unique()))
+missing_text = ", ".join(d.strftime("%d %B %Y") for d in missing_days)
+```
+
+The analysis data contain `{python} n_missing_values` empty cells, so no values
+needed to be filled in or removed. The calendar days in the period with no
+transactions are: `{python} missing_text`. This is consistent with stores being
+closed on Christmas Day, and it is treated as a real-world gap, not a data
+error. No imputation was needed.
+
+## Joining the files
+
+```{python}
+#| label: join-check
+#| include: false
+cust = pd.read_csv("data/raw/Q_Purchase_Behaviour.csv")
+n_cust_cards = len(cust)
+unmatched = int((~df_cust["LYLTY_CARD_NBR"].isin(cust["LYLTY_CARD_NBR"])).sum())
+rows_before = int(
+    pd.read_csv("data/processed/cleaning_log.csv", index_col=0).loc["rows kept", "count"]
+)
+rows_after = len(df_cust)
+
+# The report stops with an error if any of these checks fails
+assert cust["LYLTY_CARD_NBR"].is_unique
+assert unmatched == 0
+assert rows_before == rows_after
+```
+
+The transaction file records what was bought but not who bought it, and the
+customer file records each loyalty card's life stage and tier but has no
+prices. The two files were joined on `LYLTY_CARD_NBR`. This is a many-to-one
+join: many transaction records can belong to one card, but each card appears
+once in the customer file. A left join kept every transaction, and the option
+`validate="many_to_one"` makes the join stop with an error if the customer file
+ever contained duplicate cards.
+
+Three checks confirm that the join behaved as intended. The customer file lists
+`{python} f"{n_cust_cards:,}"` cards, each appearing exactly once. Transactions
+without a matching customer: `{python} unmatched`. The number of transaction
+records was `{python} f"{rows_before:,}"` before the join and
+`{python} f"{rows_after:,}"` after it, so the join neither lost nor duplicated
+records.
+
+
+# Methods
+
+## Outcome and Unit of Analysis
+
+The outcome is the price per pack of chips. For each loyalty card, total sales
+were divided by the total number of packs bought, giving one value per card.
+Cards, rather than individual transaction records, are the unit of analysis
+because records from the same card are not independent of one another: a card
+that buys cheap packs once tends to do so again. Treating each record as a
+separate observation would overstate how much evidence the data contain.
+
+## Comparison
+
+The focus group consists of cards in the Young Singles/Couples life stage with
+the Mainstream tier. The comparison group contains all other cards. The test
+statistic is the difference in mean price per pack, focus group minus
+comparison group.
+
+## Permutation Test
+
+The null hypothesis states that segment membership has no relationship with
+price per pack. If this were true, the segment labels could be reassigned to
+cards at random without changing the distribution of the statistic. The
+procedure was:
+
+1. Compute the observed difference in means.
+2. Shuffle the group labels at random, keeping both group sizes fixed, and
+   recompute the difference.
+3. Repeat the shuffle `{python} f"{N_PERM:,}"` times. The shuffled differences
+   form the null distribution, which shows the gaps that arise by chance alone.
+4. The two-sided p-value is the share of shuffled differences whose absolute
+   value is at least as large as the observed one. One is added to both the
+   numerator and the denominator, so the p-value is never exactly zero. The
+   smallest value that this procedure can report is therefore
+   `{python} f"{1 / (N_PERM + 1):.4f}"`.
+
+## Bootstrap Interval
+
+To describe the size of the gap, and how precisely it is estimated, a
+percentile bootstrap was used. Each group was resampled with replacement to its
+original size, and the difference in means was recomputed. This was repeated
+`{python} f"{N_BOOT:,}"` times. The 2.5th and 97.5th percentiles of the
+resampled differences form a 95% interval for the gap. The same procedure
+applied to a single group gives an interval for that group's mean, which is
+used to compare all customer segments in the figures below.
+
+## Reproducibility and Checks
+
+All random operations use a generator created from the fixed seed
+`{python} SEED`, so every run of the report gives identical numbers. Three
+checks supported the implementation. The functions were first run on artificial
+data with a known gap, then repeated under several different seeds to confirm
+that the results do not depend on the seed, and finally compared with the
+corresponding SciPy routines. Their outcomes are reported with the results.

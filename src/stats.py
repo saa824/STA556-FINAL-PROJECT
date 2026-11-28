@@ -2,6 +2,7 @@
 from typing import Callable
 
 import numpy as np
+import pandas as pd
 
 
 def difference_in_means(x: np.ndarray, y: np.ndarray) -> float:
@@ -71,3 +72,55 @@ def percentile_interval(values: np.ndarray, alpha: float = 0.05) -> tuple[float,
     """Percentile interval: the middle (1 - alpha) share of the values."""
     lower, upper = np.quantile(values, [alpha / 2, 1 - alpha / 2])
     return float(lower), float(upper)
+
+
+def bootstrap_statistic(
+    data: np.ndarray,
+    statistic: Callable[[np.ndarray], float],
+    n_boot: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Bootstrap distribution of a one-sample statistic.
+
+    Each replicate resamples the data with replacement (same size) and
+    applies the statistic. Returns the array of replicates.
+    """
+    if len(data) == 0:
+        raise ValueError("data must contain at least one observation.")
+    reps = np.empty(n_boot)
+    for i in range(n_boot):
+        sample = rng.choice(data, size=len(data), replace=True)
+        reps[i] = statistic(sample)
+    return reps
+
+
+def segment_mean_intervals(
+    cards: pd.DataFrame,
+    n_boot: int,
+    rng: np.random.Generator,
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Mean price per pack, with a percentile bootstrap interval, for each segment.
+
+    Expects one row per loyalty card with LIFESTAGE, PREMIUM_CUSTOMER and
+    price_per_pack. Returns one row per segment.
+    """
+    required = ["LIFESTAGE", "PREMIUM_CUSTOMER", "price_per_pack"]
+    missing = [c for c in required if c not in cards.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    rows = []
+    for (lifestage, tier), group in cards.groupby(["LIFESTAGE", "PREMIUM_CUSTOMER"]):
+        values = group["price_per_pack"].to_numpy()
+        reps = bootstrap_statistic(values, np.mean, n_boot, rng)
+        lower, upper = percentile_interval(reps, alpha)
+        rows.append({
+            "LIFESTAGE": lifestage,
+            "PREMIUM_CUSTOMER": tier,
+            "cards": len(values),
+            "mean": float(values.mean()),
+            "lower": lower,
+            "upper": upper,
+        })
+    return pd.DataFrame(rows)
